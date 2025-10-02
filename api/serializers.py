@@ -17,13 +17,14 @@ class RoleSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     role_name = serializers.CharField(source='role.name', read_only=True)
+    manager_name = serializers.CharField(source='manager.username', read_only=True)
     password = serializers.CharField(write_only=True, required=False)
     
     class Meta:
         model = User
         fields = [
-            'id', 'username', 'email', 'role', 'role_name', 
-            'password', 'is_active', 'date_joined'
+            'id', 'username', 'email', 'role', 'role_name',
+            'manager', 'manager_name', 'password', 'is_active', 'date_joined'
         ]
         read_only_fields = ['id', 'date_joined']
         extra_kwargs = {
@@ -32,6 +33,11 @@ class UserSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         password = validated_data.pop('password', None)
+
+        request_user = self.context['request'].user
+        if request_user.is_admin and validated_data.get('role').name == 'empleado':
+            validated_data['manager'] = request_user
+
         user = User(**validated_data)
         if password:
             user.set_password(password)

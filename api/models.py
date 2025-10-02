@@ -78,6 +78,17 @@ class User(AbstractBaseUser, PermissionsMixin):
         related_name='users',
         verbose_name='Rol'
     )
+
+    # Relación jerárquica
+    manager = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='manager_id',
+        related_name='employees',
+        verbose_name='Jefe/Admin'
+    )
     
     # Campos adicionales de Django (agregados con update_db.sql)
     is_active = models.BooleanField(default=True)

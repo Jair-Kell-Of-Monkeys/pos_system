@@ -11,7 +11,7 @@ from rest_framework_simplejwt.views import (
 
 from .views import (
     RoleViewSet, UserViewSet, ProductViewSet,
-    SaleViewSet, InventoryMovementViewSet, ReportViewSet
+    SaleViewSet, InventoryMovementViewSet, ReportViewSet, register_user
 )
 
 router = DefaultRouter()
@@ -26,6 +26,7 @@ urlpatterns = [
     # Autenticación JWT
     path('auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('auth/register/', register_user, name='register'),
     
     # Endpoints de la API
     path('', include(router.urls)),

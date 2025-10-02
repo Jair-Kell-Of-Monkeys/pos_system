@@ -1,10 +1,14 @@
+# pylint: disable=no-member
+
 """
 Vistas y ViewSets para la API REST
 """
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny
 from django.db.models import Sum, Count
 from django.utils import timezone
 from django.conf import settings
@@ -52,6 +56,23 @@ class UserViewSet(viewsets.ModelViewSet):
         """
         serializer = self.get_serializer(request.user)
         return Response(serializer.data)
+    
+    def create(self, request, *args, **kwargs):
+        """
+        Crear usuario. Si es admin creando empleado, asignar relación.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Si el admin está creando un empleado, asignar automáticamente
+        if request.user.is_admin:
+            role_id = request.data.get('role')
+            if role_id == 2:  # Empleado
+                serializer.validated_data['manager'] = request.user
+        
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -67,11 +88,24 @@ class ProductViewSet(viewsets.ModelViewSet):
     ordering = ['name']
     
     def get_queryset(self):
+        """
+        Filtrar productos según el rol del usuario:
+        - Admin: ve sus propios productos
+        - Empleado: ve los productos de su admin/jefe
+        """
         queryset = super().get_queryset()
-
-        # Si NO es admin, solo mostrar sus propios productos
-        if not self.request.user.is_admin:
-            queryset = queryset.filter(user=self.request.user)
+        user = self.request.user
+        
+        if user.is_admin:
+            # Admin ve solo sus productos
+            queryset = queryset.filter(user=user)
+        elif user.is_empleado:
+            # Empleado ve productos de su jefe
+            if user.manager:
+                queryset = queryset.filter(user=user.manager)
+            else:
+                # Si no tiene jefe asignado, no ve nada
+                queryset = queryset.none()
         
         # Filtrar por stock bajo
         low_stock = self.request.query_params.get('low_stock', None)
@@ -165,8 +199,9 @@ class SaleViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         queryset = super().get_queryset()
+        user = self.request.user
         
-        # Filtrar por rango de fechas
+        # Filtros de fecha
         start_date = self.request.query_params.get('start_date', None)
         end_date = self.request.query_params.get('end_date', None)
         
@@ -175,15 +210,13 @@ class SaleViewSet(viewsets.ModelViewSet):
         if end_date:
             queryset = queryset.filter(date__lte=end_date)
         
-        # Nuevo: Filtro opcional por usuario específico (solo admin)
-        user_id = self.request.query_params.get('user_id', None)
-        if user_id and self.request.user.is_admin:
-            queryset = queryset.filter(user_id=user_id)
-        
-        # Empleados solo ven sus propias ventas (a menos que usen my-sales)
-        # Admin puede ver todas con /api/sales/ o específicas con ?user_id=X
-        if not self.request.user.is_admin and not user_id:
-            queryset = queryset.filter(user=self.request.user)
+        if user.is_admin:
+            # Admin ve sus ventas y las de sus empleados
+            employee_ids = user.employees.values_list('id', flat=True)
+            queryset = queryset.filter(user__in=[user.id] + list(employee_ids))
+        elif user.is_empleado:
+            # Empleado solo ve sus propias ventas
+            queryset = queryset.filter(user=user)
         
         return queryset
     
@@ -665,3 +698,72 @@ class ReportViewSet(viewsets.ModelViewSet):
             'start_date': start_date.date().isoformat(),
             'products': products_list
         })
+    
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register_user(request):
+    """
+    Registro público de nuevos usuarios
+    POST /api/auth/register/
+    """
+    username = request.data.get('username')
+    email = request.data.get('email')
+    password = request.data.get('password')
+
+    # FORZAR rol empleado
+    role_id = 2  # Siempre empleado
+    
+    # Validaciones básicas
+    if not username or not email or not password:
+        return Response(
+            {'error': 'Se requieren username, email y password'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Verificar si el usuario ya existe
+    if User.objects.filter(username=username).exists():
+        return Response(
+            {'error': 'El nombre de usuario ya está en uso'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    if User.objects.filter(email=email).exists():
+        return Response(
+            {'error': 'El email ya está registrado'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Obtener rol
+    try:
+        role = Role.objects.get(id=role_id)
+    except Role.DoesNotExist:
+        return Response(
+            {'error': 'Rol inválido'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Crear usuario
+    try:
+        user = User.objects.create_user(
+            username=username,
+            email=email,
+            password=password,
+            role=role,
+            is_active=True
+        )
+        
+        return Response({
+            'message': 'Usuario creado exitosamente',
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'role': role.name
+            }
+        }, status=status.HTTP_201_CREATED)
+    
+    except Exception as e:
+        return Response(
+            {'error': f'Error al crear usuario: {str(e)}'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
