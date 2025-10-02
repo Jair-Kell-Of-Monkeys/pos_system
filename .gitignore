@@ -1,0 +1,29 @@
+# .gitignore
+# Python
+*.py[cod]
+__pycache__/
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+/media/qr_codes/*
+/media/barcodes/*
+!/media/qr_codes/.gitkeep
+!/media/barcodes/.gitkeep
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
