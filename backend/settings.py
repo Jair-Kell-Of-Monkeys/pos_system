@@ -129,6 +129,7 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Media files (QR codes, barcodes)
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+from django.conf import settings
 
 
 # Default primary key field type

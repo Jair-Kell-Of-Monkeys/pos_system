@@ -7,6 +7,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Count
 from django.utils import timezone
+from django.conf import settings
+from django.utils.timezone import make_aware
 from datetime import timedelta
 from decimal import Decimal
 
@@ -19,7 +21,8 @@ from .permissions import (
     IsAdmin, ProductPermission, SalePermission,
     UserManagementPermission, IsEmpleadoOrAdmin
 )
-
+from django.http import FileResponse, Http404
+import os
 
 class RoleViewSet(viewsets.ReadOnlyModelViewSet):
     """
@@ -99,6 +102,54 @@ class ProductViewSet(viewsets.ModelViewSet):
         movements = InventoryMovement.objects.filter(product=product)
         serializer = InventoryMovementSerializer(movements, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='qrcode')
+    def get_qr_code(self, request, pk=None):
+        """
+        Obtener imagen del código QR del producto
+        GET /api/products/{id}/qrcode/
+        """
+        product = self.get_object()
+        
+        if not product.qr_code_path:
+            return Response(
+                {'error': 'Este producto no tiene código QR generado'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        file_path = os.path.join(settings.MEDIA_ROOT, product.qr_code_path)
+        
+        if not os.path.exists(file_path):
+            return Response(
+                {'error': 'Archivo de código QR no encontrado'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        return FileResponse(open(file_path, 'rb'), content_type='image/png')
+    
+    @action(detail=True, methods=['get'], url_path='barcode')
+    def get_barcode(self, request, pk=None):
+        """
+        Obtener imagen del código de barras del producto
+        GET /api/products/{id}/barcode/
+        """
+        product = self.get_object()
+        
+        if not product.barcode_path:
+            return Response(
+                {'error': 'Este producto no tiene código de barras generado'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        file_path = os.path.join(settings.MEDIA_ROOT, product.barcode_path)
+        
+        if not os.path.exists(file_path):
+            return Response(
+                {'error': 'Archivo de código de barras no encontrado'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        return FileResponse(open(file_path, 'rb'), content_type='image/png')
 
 
 class SaleViewSet(viewsets.ModelViewSet):
@@ -124,11 +175,34 @@ class SaleViewSet(viewsets.ModelViewSet):
         if end_date:
             queryset = queryset.filter(date__lte=end_date)
         
-        # Empleados solo ven sus propias ventas
-        if not self.request.user.is_admin:
+        # Nuevo: Filtro opcional por usuario específico (solo admin)
+        user_id = self.request.query_params.get('user_id', None)
+        if user_id and self.request.user.is_admin:
+            queryset = queryset.filter(user_id=user_id)
+        
+        # Empleados solo ven sus propias ventas (a menos que usen my-sales)
+        # Admin puede ver todas con /api/sales/ o específicas con ?user_id=X
+        if not self.request.user.is_admin and not user_id:
             queryset = queryset.filter(user=self.request.user)
         
         return queryset
+    
+    @action(detail=False, methods=['get'], url_path='my-sales')
+    def my_sales(self, request):
+        """
+        Ver historial de ventas del usuario actual
+        GET /api/sales/my-sales/
+        """
+        sales = Sale.objects.filter(user=request.user).select_related('user').prefetch_related('items__product')
+        
+        # Aplicar paginación
+        page = self.paginate_queryset(sales)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(sales, many=True)
+        return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
     def summary(self, request):
@@ -188,6 +262,8 @@ class SaleViewSet(viewsets.ModelViewSet):
         ]
         
         return Response(result)
+    
+
 
 
 class InventoryMovementViewSet(viewsets.ModelViewSet):
@@ -232,6 +308,40 @@ class InventoryMovementViewSet(viewsets.ModelViewSet):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
             return [IsAdmin()]
         return [IsEmpleadoOrAdmin()]
+    
+    @action(detail=False, methods=['get'], url_path='low-stock')
+    def low_stock_alert(self, request):
+        """
+        Obtener productos con bajo stock (<=10)
+        GET /api/inventory-movements/low-stock/
+        """
+        # Umbral de stock bajo (configurable)
+        threshold = int(request.query_params.get('threshold', 10))
+        
+        low_stock_products = Product.objects.filter(stock__lte=threshold).select_related('user')
+        
+        # Si no es admin, solo mostrar sus productos
+        if not request.user.is_admin:
+            low_stock_products = low_stock_products.filter(user=request.user)
+        
+        products_data = []
+        for product in low_stock_products:
+            products_data.append({
+                'id': product.id,
+                'name': product.name,
+                'code': product.code,
+                'category': product.category,
+                'current_stock': product.stock,
+                'price': float(product.price),
+                'user': product.user.username,
+                'status': 'critical' if product.stock <= 5 else 'low'
+            })
+        
+        return Response({
+            'count': len(products_data),
+            'threshold': threshold,
+            'products': products_data
+        })
 
 
 class ReportViewSet(viewsets.ModelViewSet):
@@ -400,3 +510,158 @@ class ReportViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(report)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['get'], url_path='sales/daily')
+    def daily_sales_report(self, request):
+        """
+        Reporte de ventas del día actual
+        GET /api/reports/sales/daily/
+        """
+        from django.utils.timezone import now, make_aware
+        import datetime
+        
+        today = now().date()
+        start_datetime = make_aware(datetime.datetime.combine(today, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(today, datetime.time.max))
+        
+        sales = Sale.objects.filter(
+            date__gte=start_datetime,
+            date__lte=end_datetime
+        )
+        
+        # Filtrar por usuario si no es admin
+        if not request.user.is_admin:
+            sales = sales.filter(user=request.user)
+        
+        total_sales = sales.aggregate(total=Sum('total_price'))['total'] or 0
+        count_sales = sales.count()
+        
+        return Response({
+            'date': today.isoformat(),
+            'total_sales': float(total_sales),
+            'count_sales': count_sales,
+            'average_sale': float(total_sales / count_sales) if count_sales > 0 else 0.0
+        })
+    
+    @action(detail=False, methods=['get'], url_path='sales/weekly')
+    def weekly_sales_report(self, request):
+        """
+        Reporte de ventas de la semana actual
+        GET /api/reports/sales/weekly/
+        """
+        from django.utils.timezone import now
+        import datetime
+        
+        today = now().date()
+        start_of_week = today - datetime.timedelta(days=today.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
+        
+        start_datetime = make_aware(datetime.datetime.combine(start_of_week, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(end_of_week, datetime.time.max))
+        
+        sales = Sale.objects.filter(
+            date__gte=start_datetime,
+            date__lte=end_datetime
+        )
+        
+        if not request.user.is_admin:
+            sales = sales.filter(user=request.user)
+        
+        total_sales = sales.aggregate(total=Sum('total_price'))['total'] or 0
+        count_sales = sales.count()
+        
+        # Agrupar por día
+        from collections import defaultdict
+        daily_breakdown = defaultdict(lambda: {'total': 0, 'count': 0})
+        
+        for sale in sales:
+            day_key = sale.date.strftime('%Y-%m-%d')
+            daily_breakdown[day_key]['total'] += float(sale.total_price)
+            daily_breakdown[day_key]['count'] += 1
+        
+        return Response({
+            'week_start': start_of_week.isoformat(),
+            'week_end': end_of_week.isoformat(),
+            'total_sales': float(total_sales),
+            'count_sales': count_sales,
+            'average_sale': float(total_sales / count_sales) if count_sales > 0 else 0.0,
+            'daily_breakdown': dict(daily_breakdown)
+        })
+    
+    @action(detail=False, methods=['get'], url_path='sales/monthly')
+    def monthly_sales_report(self, request):
+        """
+        Reporte de ventas del mes actual
+        GET /api/reports/sales/monthly/
+        """
+        from django.utils.timezone import now
+        import datetime
+        
+        today = now().date()
+        start_of_month = today.replace(day=1)
+        
+        # Último día del mes
+        if today.month == 12:
+            end_of_month = today.replace(day=31)
+        else:
+            end_of_month = (start_of_month.replace(month=start_of_month.month + 1) - datetime.timedelta(days=1))
+        
+        start_datetime = make_aware(datetime.datetime.combine(start_of_month, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(end_of_month, datetime.time.max))
+        
+        sales = Sale.objects.filter(
+            date__gte=start_datetime,
+            date__lte=end_datetime
+        )
+        
+        if not request.user.is_admin:
+            sales = sales.filter(user=request.user)
+        
+        total_sales = sales.aggregate(total=Sum('total_price'))['total'] or 0
+        count_sales = sales.count()
+        
+        return Response({
+            'month': start_of_month.strftime('%Y-%m'),
+            'month_start': start_of_month.isoformat(),
+            'month_end': end_of_month.isoformat(),
+            'total_sales': float(total_sales),
+            'count_sales': count_sales,
+            'average_sale': float(total_sales / count_sales) if count_sales > 0 else 0.0
+        })
+    
+    @action(detail=False, methods=['get'], url_path='sales/top-products')
+    def top_products_report(self, request):
+        """
+        Productos más vendidos (últimos 30 días por defecto)
+        GET /api/reports/sales/top-products/?days=30
+        """
+        from django.utils.timezone import now
+        import datetime
+        
+        days = int(request.query_params.get('days', 30))
+        start_date = now() - datetime.timedelta(days=days)
+        
+        top_products = SaleItem.objects.filter(
+            sale__date__gte=start_date
+        ).values('product__name', 'product__code', 'product__category').annotate(
+            total_quantity=Sum('quantity'),
+            total_amount=Sum('subtotal'),
+            times_sold=Count('id')
+        ).order_by('-total_quantity')[:20]
+        
+        products_list = []
+        for item in top_products:
+            products_list.append({
+                'product_name': item['product__name'],
+                'product_code': item['product__code'],
+                'category': item['product__category'],
+                'total_quantity': int(item['total_quantity']),
+                'total_amount': float(item['total_amount']),
+                'times_sold': item['times_sold']
+            })
+        
+        return Response({
+            'period_days': days,
+            'start_date': start_date.date().isoformat(),
+            'products': products_list
+        })
