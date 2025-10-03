@@ -3,7 +3,7 @@
 Serializadores para la API REST
 """
 from rest_framework import serializers
-from .models import Role, User, Product, Sale, SaleItem, InventoryMovement, Report
+from .models import Role, User, Product, Sale, SaleItem, InventoryMovement, Report, ActivityLog
 from django.db import transaction
 from decimal import Decimal
 
@@ -171,13 +171,15 @@ class SaleItemSerializer(serializers.ModelSerializer):
 class SaleSerializer(serializers.ModelSerializer):
     items = SaleItemSerializer(many=True)
     user_name = serializers.CharField(source='user.username', read_only=True)
+    cancelled_by_name = serializers.CharField(source='cancelled_by.username', read_only=True)
     
     class Meta:
         model = Sale
         fields = [
-            'id', 'user', 'user_name', 'date', 'total_price', 'items'
+            'id', 'user', 'user_name', 'date', 'total_price', 'items',
+            'is_cancelled', 'cancelled_at', 'cancelled_by', 'cancelled_by_name'
         ]
-        read_only_fields = ['id', 'user', 'date', 'total_price']
+        read_only_fields = ['id', 'user', 'date', 'total_price', 'is_cancelled', 'cancelled_at', 'cancelled_by']
     
     def validate_items(self, value):
         if not value:
@@ -305,3 +307,47 @@ class ReportSerializer(serializers.ModelSerializer):
         report = Report(user=user, **validated_data)
         report.save()
         return report
+    
+class ActivityLogSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    
+    class Meta:
+        model = ActivityLog
+        fields = ['id', 'user', 'user_name', 'action', 'entity_type', 'entity_id', 'details', 'created_at']
+        read_only_fields = ['id', 'user', 'created_at']
+
+
+class UserActivitySerializer(serializers.Serializer):
+    """
+    Serializer para historial de actividad de usuario
+    """
+    sales_count = serializers.IntegerField()
+    total_sales_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    products_created = serializers.IntegerField()
+    recent_sales = SaleSerializer(many=True)
+    recent_activity = ActivityLogSerializer(many=True)
+
+
+class StockAdjustmentSerializer(serializers.Serializer):
+    """
+    Serializer para ajuste manual de stock
+    """
+    adjustment = serializers.IntegerField(required=True, help_text="Cantidad a ajustar (positivo o negativo)")
+    reason = serializers.CharField(required=True, max_length=255, help_text="Motivo del ajuste")
+    
+    def validate_adjustment(self, value):
+        if value == 0:
+            raise serializers.ValidationError("El ajuste no puede ser 0")
+        return value
+
+
+class DashboardSummarySerializer(serializers.Serializer):
+    """
+    Serializer para resumen del dashboard
+    """
+    today_sales = serializers.DictField()
+    top_product = serializers.DictField()
+    low_stock_count = serializers.IntegerField()
+    low_stock_products = serializers.ListField()
+    sales_by_employee = serializers.ListField()
+    total_inventory_value = serializers.DecimalField(max_digits=12, decimal_places=2)

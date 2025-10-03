@@ -11,15 +11,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
 from django.db.models import Sum, Count
 from django.utils import timezone
+from django.db import transaction
 from django.conf import settings
 from django.utils.timezone import make_aware
 from datetime import timedelta
 from decimal import Decimal
 
-from .models import Role, User, Product, Sale, SaleItem, InventoryMovement, Report
+from .models import Role, User, Product, Sale, SaleItem, InventoryMovement, Report, ActivityLog
 from .serializers import (
     RoleSerializer, UserSerializer, ProductSerializer,
-    SaleSerializer, InventoryMovementSerializer, ReportSerializer
+    SaleSerializer, InventoryMovementSerializer, ReportSerializer, StockAdjustmentSerializer, ActivityLogSerializer
 )
 from .permissions import (
     IsAdmin, ProductPermission, SalePermission,
@@ -57,6 +58,40 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(request.user)
         return Response(serializer.data)
     
+    @action(detail=True, methods=['get'], url_path='activity')
+    def user_activity(self, request, pk=None):
+        """GET /api/users/{id}/activity/"""
+        user = self.get_object()
+        
+        if not request.user.is_admin and request.user.id != user.id:
+            return Response(
+                {'error': 'No tienes permiso para ver esta actividad'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Ventas realizadas
+        sales = Sale.objects.filter(user=user, is_cancelled=False).order_by('-date')[:10]
+        sales_count = Sale.objects.filter(user=user, is_cancelled=False).count()
+        total_sales = Sale.objects.filter(user=user, is_cancelled=False).aggregate(
+            total=Sum('total_price')
+        )['total'] or 0
+        
+        # Productos creados
+        products_created = Product.objects.filter(user=user).count() if user.is_admin else 0
+        
+        # Logs de actividad
+        activity_logs = ActivityLog.objects.filter(user=user).order_by('-created_at')[:20]
+        
+        data = {
+            'sales_count': sales_count,
+            'total_sales_amount': float(total_sales),
+            'products_created': products_created,
+            'recent_sales': SaleSerializer(sales, many=True, context={'request': request}).data,
+            'recent_activity': ActivityLogSerializer(activity_logs, many=True).data
+        }
+        
+        return Response(data)
+    
     def create(self, request, *args, **kwargs):
         """
         Crear usuario. Si es admin creando empleado, asignar relación.
@@ -73,6 +108,81 @@ class UserViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+    
+    class UserViewSet(viewsets.ModelViewSet):
+        def partial_update(self, request, *args, **kwargs):
+            """
+            PATCH /api/users/{id}/
+            Actualizar datos del usuario (rol, contraseña, etc.)
+            """
+            instance = self.get_object()
+            
+            # Solo admin o el propio usuario pueden actualizar
+            if not request.user.is_admin and request.user.id != instance.id:
+                return Response(
+                    {'error': 'No tienes permiso para actualizar este usuario'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Si se está cambiando el rol, solo admin puede hacerlo
+            if 'role' in request.data and not request.user.is_admin:
+                return Response(
+                    {'error': 'Solo administradores pueden cambiar roles'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            serializer = self.get_serializer(instance, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+            
+            # Registrar actividad
+            ActivityLog.objects.create(
+                user=request.user,
+                action='update',
+                entity_type='user',
+                entity_id=instance.id,
+                details={'changes': request.data}
+            )
+            
+            return Response(serializer.data)
+        
+        @action(detail=True, methods=['get'], url_path='activity')
+        def user_activity(self, request, pk=None):
+            """
+            GET /api/users/{id}/activity/
+            Histórico de actividad de un usuario
+            """
+            user = self.get_object()
+            
+            # Solo admin o el propio usuario pueden ver su actividad
+            if not request.user.is_admin and request.user.id != user.id:
+                return Response(
+                    {'error': 'No tienes permiso para ver esta actividad'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Ventas realizadas
+            sales = Sale.objects.filter(user=user, is_cancelled=False).order_by('-date')[:10]
+            sales_count = Sale.objects.filter(user=user, is_cancelled=False).count()
+            total_sales = Sale.objects.filter(user=user, is_cancelled=False).aggregate(
+                total=Sum('total_price')
+            )['total'] or 0
+            
+            # Productos creados (solo si es admin)
+            products_created = Product.objects.filter(user=user).count() if user.is_admin else 0
+            
+            # Logs de actividad recientes
+            activity_logs = ActivityLog.objects.filter(user=user).order_by('-created_at')[:20]
+            
+            data = {
+                'sales_count': sales_count,
+                'total_sales_amount': float(total_sales),
+                'products_created': products_created,
+                'recent_sales': SaleSerializer(sales, many=True).data,
+                'recent_activity': ActivityLogSerializer(activity_logs, many=True).data
+            }
+            
+            return Response(data)
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -184,6 +294,66 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
         
         return FileResponse(open(file_path, 'rb'), content_type='image/png')
+    
+    @action(detail=True, methods=['patch'], url_path='adjust-stock')
+    def adjust_stock(self, request, pk=None):
+        """
+        PATCH /api/products/{id}/adjust-stock/
+        Ajuste manual de inventario
+        Solo admin
+        """
+        product = self.get_object()
+        serializer = StockAdjustmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        adjustment = serializer.validated_data['adjustment']
+        reason = serializer.validated_data['reason']
+        
+        # Validar que no resulte en stock negativo
+        new_stock = product.stock + adjustment
+        if new_stock < 0:
+            return Response(
+                {'error': f'El ajuste resultaría en stock negativo. Stock actual: {product.stock}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Actualizar stock
+        old_stock = product.stock
+        product.stock = new_stock
+        product.save()
+        
+        # Crear movimiento de inventario
+        movement_type = 'entrada' if adjustment > 0 else 'salida'
+        InventoryMovement.objects.create(
+            product=product,
+            movement_type=movement_type,
+            quantity=abs(adjustment),
+            note=f"Ajuste manual: {reason}"
+        )
+        
+        # Registrar actividad
+        ActivityLog.objects.create(
+            user=request.user,
+            action='adjust_stock',
+            entity_type='product',
+            entity_id=product.id,
+            details={
+                'old_stock': old_stock,
+                'new_stock': new_stock,
+                'adjustment': adjustment,
+                'reason': reason
+            }
+        )
+        
+        return Response({
+            'message': 'Stock ajustado correctamente',
+            'product': ProductSerializer(product, context={'request': request}).data,
+            'old_stock': old_stock,
+            'new_stock': new_stock,
+            'adjustment': adjustment
+        })
+    
+
 
 
 class SaleViewSet(viewsets.ModelViewSet):
@@ -296,6 +466,99 @@ class SaleViewSet(viewsets.ModelViewSet):
         
         return Response(result)
     
+    @action(detail=False, methods=['get'], url_path='by-user/(?P<user_id>[^/.]+)')
+    def sales_by_user(self, request, user_id=None):
+        """
+        GET /api/sales/by-user/{user_id}/
+        """
+        # Validar permisos
+        if not request.user.is_admin and str(request.user.id) != str(user_id):
+            return Response(
+                {'error': 'No tienes permiso para ver ventas de otros usuarios'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'Usuario no encontrado'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Si es admin verificando empleado
+        if request.user.is_admin and target_user.is_empleado:
+            if target_user.manager_id != request.user.id:
+                return Response(
+                    {'error': 'Este empleado no pertenece a tu organización'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        sales = Sale.objects.filter(user_id=user_id).select_related('user').prefetch_related('items__product')
+        
+        # Filtros opcionales
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        if start_date:
+            sales = sales.filter(date__gte=start_date)
+        if end_date:
+            sales = sales.filter(date__lte=end_date)
+        
+        page = self.paginate_queryset(sales)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(sales, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'], url_path='cancel')
+    @transaction.atomic
+    def cancel_sale(self, request, pk=None):
+        """POST /api/sales/{id}/cancel/"""
+        sale = self.get_object()
+        
+        if sale.is_cancelled:
+            return Response(
+                {'error': 'Esta venta ya está cancelada'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Devolver stock
+        for item in sale.items.all():
+            product = item.product
+            product.stock += item.quantity
+            product.save()
+            
+            InventoryMovement.objects.create(
+                product=product,
+                movement_type='entrada',
+                quantity=item.quantity,
+                note=f"Devolución por cancelación de venta #{sale.id}"
+            )
+        
+        # Marcar como cancelada
+        sale.is_cancelled = True
+        sale.cancelled_at = timezone.now()
+        sale.cancelled_by = request.user
+        sale.save()
+        
+        # Log
+        ActivityLog.objects.create(
+            user=request.user,
+            action='cancel',
+            entity_type='sale',
+            entity_id=sale.id,
+            details={
+                'original_total': float(sale.total_price),
+                'items_count': sale.items.count()
+            }
+        )
+        
+        return Response({
+            'message': 'Venta cancelada exitosamente',
+            'sale': SaleSerializer(sale, context={'request': request}).data
+        })
 
 
 
@@ -767,3 +1030,189 @@ def register_user(request):
             {'error': f'Error al crear usuario: {str(e)}'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+    
+
+class DashboardViewSet(viewsets.ViewSet):
+    """
+    ViewSet para dashboard y resúmenes
+    """
+    permission_classes = [IsAuthenticated]
+    
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        """
+        GET /api/dashboard/summary/
+        Resumen global del dashboard
+        """
+        from django.utils.timezone import now
+        import datetime
+        
+        user = request.user
+        today = now().date()
+        start_datetime = make_aware(datetime.datetime.combine(today, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(today, datetime.time.max))
+        
+        # Determinar qué datos puede ver según rol
+        if user.is_admin:
+            # Admin ve sus datos + de sus empleados
+            employee_ids = list(user.employees.values_list('id', flat=True))
+            user_ids = [user.id] + employee_ids
+            products_queryset = Product.objects.filter(user=user)
+        else:
+            # Empleado solo ve sus datos
+            user_ids = [user.id]
+            products_queryset = Product.objects.filter(user=user.manager) if user.manager else Product.objects.none()
+        
+        # 1. Ventas de hoy
+        today_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=start_datetime,
+            date__lte=end_datetime,
+            is_cancelled=False
+        )
+        today_sales_data = {
+            'count': today_sales.count(),
+            'total': float(today_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+        }
+        
+        # 2. Top producto (últimos 30 días)
+        thirty_days_ago = now() - datetime.timedelta(days=30)
+        top_product_data = SaleItem.objects.filter(
+            sale__date__gte=thirty_days_ago,
+            sale__user_id__in=user_ids,
+            sale__is_cancelled=False
+        ).values('product__name', 'product__code').annotate(
+            total_quantity=Sum('quantity')
+        ).order_by('-total_quantity').first()
+        
+        # 3. Stock bajo
+        low_stock_products = products_queryset.filter(stock__lte=10)
+        low_stock_data = []
+        for p in low_stock_products[:5]:
+            low_stock_data.append({
+                'id': p.id,
+                'name': p.name,
+                'code': p.code,
+                'stock': p.stock,
+                'status': 'critical' if p.stock <= 5 else 'low'
+            })
+        
+        # 4. Ventas por empleado (solo para admin)
+        sales_by_employee = []
+        if user.is_admin:
+            for emp_id in employee_ids:
+                emp = User.objects.get(id=emp_id)
+                emp_sales = Sale.objects.filter(
+                    user_id=emp_id,
+                    date__gte=start_datetime,
+                    date__lte=end_datetime,
+                    is_cancelled=False
+                )
+                sales_by_employee.append({
+                    'employee_id': emp.id,
+                    'employee_name': emp.username,
+                    'sales_count': emp_sales.count(),
+                    'sales_total': float(emp_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+                })
+        
+        # 5. Valor total del inventario
+        total_inventory_value = sum(float(p.price * p.stock) for p in products_queryset)
+        
+        response_data = {
+            'today_sales': today_sales_data,
+            'top_product': top_product_data or {},
+            'low_stock_count': low_stock_products.count(),
+            'low_stock_products': low_stock_data,
+            'sales_by_employee': sales_by_employee,
+            'total_inventory_value': total_inventory_value
+        }
+        
+        return Response(response_data)
+class SystemViewSet(viewsets.ViewSet):
+    """ViewSet para operaciones del sistema"""
+    permission_classes = [IsAdmin]  # Por defecto admin
+    
+    @action(detail=False, methods=['post'], url_path='backup')
+    def backup(self, request):
+        """POST /api/backup/"""
+        import subprocess
+        import os
+        from django.conf import settings
+        
+        backup_dir = os.path.join(settings.BASE_DIR, 'backups')
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = os.path.join(backup_dir, f'pos_backup_{timestamp}.sql')
+        
+        try:
+            db_settings = settings.DATABASES['default']
+            command = [
+                'pg_dump',
+                '-h', db_settings['HOST'],
+                '-p', str(db_settings['PORT']),
+                '-U', db_settings['USER'],
+                '-d', db_settings['NAME'],
+                '-n', 'pos_system',
+                '-f', backup_file
+            ]
+            
+            env = os.environ.copy()
+            env['PGPASSWORD'] = db_settings['PASSWORD']
+            
+            subprocess.run(command, env=env, check=True)
+            
+            ActivityLog.objects.create(
+                user=request.user,
+                action='create',
+                entity_type='backup',
+                entity_id=0,
+                details={'file': backup_file}
+            )
+            
+            return Response({
+                'message': 'Respaldo creado exitosamente',
+                'file': backup_file,
+                'timestamp': timestamp
+            })
+        
+        except subprocess.CalledProcessError as e:
+            return Response(
+                {'error': f'Error al crear respaldo: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'], url_path='health', permission_classes=[])
+    def health_check(self, request):
+        """GET /api/health/ - Sin autenticación"""
+        from django.db import connection
+        import os
+        from django.conf import settings
+        
+        status_data = {
+            'status': 'healthy',
+            'timestamp': timezone.now().isoformat(),
+            'components': {}
+        }
+        
+        # Verificar base de datos
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            status_data['components']['database'] = 'healthy'
+        except Exception as e:
+            status_data['status'] = 'unhealthy'
+            status_data['components']['database'] = f'error: {str(e)}'
+        
+        # Verificar directorios media
+        media_dirs = ['qr_codes', 'barcodes']
+        for dir_name in media_dirs:
+            dir_path = os.path.join(settings.MEDIA_ROOT, dir_name)
+            if os.path.exists(dir_path) and os.access(dir_path, os.W_OK):
+                status_data['components'][f'media_{dir_name}'] = 'healthy'
+            else:
+                status_data['status'] = 'degraded'
+                status_data['components'][f'media_{dir_name}'] = 'not_writable'
+        
+        http_status = status.HTTP_200_OK if status_data['status'] == 'healthy' else status.HTTP_503_SERVICE_UNAVAILABLE
+        return Response(status_data, status=http_status)

@@ -210,6 +210,19 @@ class Sale(models.Model):
         verbose_name='Precio Total'
     )
     
+    # Nuevos campos para cancelación
+    is_cancelled = models.BooleanField(default=False, verbose_name='Cancelada')
+    cancelled_at = models.DateTimeField(null=True, blank=True, verbose_name='Fecha de Cancelación')
+    cancelled_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='cancelled_by_id',
+        related_name='cancelled_sales',
+        verbose_name='Cancelada por'
+    )
+    
     class Meta:
         db_table = 'sales'
         managed = False
@@ -218,10 +231,9 @@ class Sale(models.Model):
         ordering = ['-date']
     
     def __str__(self) -> str:
-        # self.pk es más seguro que self.id cuando managed=False
         sale_id = self.pk if self.pk else 'Nueva'
-        return f"Venta #{sale_id} - ${self.total_price}"
-
+        status = ' (CANCELADA)' if self.is_cancelled else ''
+        return f"Venta #{sale_id} - ${self.total_price}{status}"
 
 class SaleItem(models.Model):
     """
@@ -342,3 +354,42 @@ class Report(models.Model):
         # Convertir DateTimeField a datetime antes de usar strftime
         fecha_str = self.generated_at.strftime('%Y-%m-%d') if self.generated_at else 'Sin fecha'
         return f"{self.type} - {fecha_str}"
+    
+class ActivityLog(models.Model):
+    """
+    Registro de actividad de usuarios
+    Tabla: activity_logs
+    """
+    objects: ClassVar[models.Manager['ActivityLog']]
+    
+    ACTION_CHOICES = [
+        ('create', 'Crear'),
+        ('update', 'Actualizar'),
+        ('delete', 'Eliminar'),
+        ('sale', 'Venta'),
+        ('cancel', 'Cancelar'),
+        ('adjust_stock', 'Ajustar Stock'),
+    ]
+    
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        db_column='user_id',
+        related_name='activity_logs',
+        verbose_name='Usuario'
+    )
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES, verbose_name='Acción')
+    entity_type = models.CharField(max_length=50, verbose_name='Tipo de Entidad')
+    entity_id = models.IntegerField(verbose_name='ID de Entidad')
+    details = models.JSONField(null=True, blank=True, verbose_name='Detalles')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Fecha')
+    
+    class Meta:
+        db_table = 'activity_logs'
+        managed = False
+        verbose_name = 'Log de Actividad'
+        verbose_name_plural = 'Logs de Actividad'
+        ordering = ['-created_at']
+    
+    def __str__(self) -> str:
+        return f"{self.user.username} - {self.action} - {self.entity_type}#{self.entity_id}"

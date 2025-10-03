@@ -27,3 +27,13 @@ db.sqlite3-journal
 .idea/
 *.swp
 *.swo
+
+# backups/.gitignore
+# No versionar archivos de respaldo
+*.sql
+*.dump
+*.backup
+*
+
+# Pero mantener la carpeta
+!.gitignore
