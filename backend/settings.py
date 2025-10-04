@@ -129,7 +129,6 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Media files (QR codes, barcodes)
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
-from django.conf import settings
 
 
 # Default primary key field type
@@ -186,9 +185,37 @@ SIMPLE_JWT = {
 # CORS configuration
 CORS_ALLOWED_ORIGINS = env.list(
     'CORS_ALLOWED_ORIGINS',
-    default=['http://localhost:5173', 'http://localhost:3000']
+    default=['http://localhost:5173', 'http://localhost:3000', 'http://10.0.2.2:8000']
 )
+
+# Permitir todos los orígenes solo en desarrollo
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOW_CREDENTIALS = True
+
+# Métodos HTTP permitidos
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+# Headers permitidos
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnu',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
 
 
 # Security settings para producción
