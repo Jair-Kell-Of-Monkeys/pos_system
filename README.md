@@ -11,7 +11,7 @@
 ### 1. Clonar el repositorio
 
 ```bash
-git clone https://github.com/Jair-Kell-Of-Monkeys/pos_system/commits/main/
+git clone https://github.com/Jair-Kell-Of-Monkeys/pos_system.git
 cd pos-system
 ```
 
