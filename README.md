@@ -66,17 +66,20 @@ cp .env.example .env
 Tu `.env` debe verse así:
 
 ```properties
-SECRET_KEY=tu_secret_key_aqui
+SECRET_KEY=cambien-esto-como-quieran
 DEBUG=True
 ALLOWED_HOSTS=localhost,127.0.0.1,10.0.2.2
 
 DB_NAME=pos_system_db
 DB_USER=postgres
-DB_PASSWORD=TU_CONTRASEÑA_POSTGRES
+DB_PASSWORD=la-contraseña-que-le-pusieron-a-su-usuario-postgres-debe-de-ir-aqui
 DB_HOST=localhost
 DB_PORT=5432
 
 CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,http://10.0.2.2:8000
+
+JWT_ACCESS_TOKEN_LIFETIME_MINUTES=60
+JWT_REFRESH_TOKEN_LIFETIME_DAYS=7
 ```
 
 ### 6. Crear entorno virtual e instalar dependencias
@@ -87,7 +90,7 @@ python -m venv venv
 
 # Activar entorno virtual
 # Windows:
-venv\Scripts\activate
+.\venv\Scripts\Activate.ps1 
 # macOS/Linux:
 source venv/bin/activate
 
@@ -110,8 +113,8 @@ python manage.py createsuperuser
 
 Ingresa:
 - Username: admin (o el que prefieras)
-- Email: tu@email.com
-- Password: (contraseña segura)
+- Email: la-que-quiera@email.com
+- Password: (contraseña facil que te acuerdes)
 
 ### 9. Iniciar el servidor
 
@@ -231,4 +234,4 @@ python manage.py runserver 0.0.0.0:8000 --verbosity 2
 
 ## Contacto
 
-Si tienes problemas con la instalación, contacta al equipo en [canal de comunicación].
+Si tienes problemas con la instalación, pues que mal por que a mi si me funciona.
