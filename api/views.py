@@ -11,7 +11,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
 from django.db.models import Sum, Count
 from django.utils import timezone
-from django.db import transaction
+from django.db import transaction, models
+from django_ratelimit.decorators import ratelimit
+from django.utils.decorators import method_decorator
 from django.conf import settings
 from django.utils.timezone import make_aware
 from datetime import timedelta
@@ -54,47 +56,15 @@ class UserViewSet(viewsets.ModelViewSet):
     def me(self, request):
         """
         Obtener información del usuario actual
+        GET /api/users/me/
         """
         serializer = self.get_serializer(request.user)
         return Response(serializer.data)
     
-    @action(detail=True, methods=['get'], url_path='activity')
-    def user_activity(self, request, pk=None):
-        """GET /api/users/{id}/activity/"""
-        user = self.get_object()
-        
-        if not request.user.is_admin and request.user.id != user.id:
-            return Response(
-                {'error': 'No tienes permiso para ver esta actividad'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Ventas realizadas
-        sales = Sale.objects.filter(user=user, is_cancelled=False).order_by('-date')[:10]
-        sales_count = Sale.objects.filter(user=user, is_cancelled=False).count()
-        total_sales = Sale.objects.filter(user=user, is_cancelled=False).aggregate(
-            total=Sum('total_price')
-        )['total'] or 0
-        
-        # Productos creados
-        products_created = Product.objects.filter(user=user).count() if user.is_admin else 0
-        
-        # Logs de actividad
-        activity_logs = ActivityLog.objects.filter(user=user).order_by('-created_at')[:20]
-        
-        data = {
-            'sales_count': sales_count,
-            'total_sales_amount': float(total_sales),
-            'products_created': products_created,
-            'recent_sales': SaleSerializer(sales, many=True, context={'request': request}).data,
-            'recent_activity': ActivityLogSerializer(activity_logs, many=True).data
-        }
-        
-        return Response(data)
-    
     def create(self, request, *args, **kwargs):
         """
         Crear usuario. Si es admin creando empleado, asignar relación.
+        POST /api/users/
         """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -109,81 +79,79 @@ class UserViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     
-    class UserViewSet(viewsets.ModelViewSet):
-        def partial_update(self, request, *args, **kwargs):
-            """
-            PATCH /api/users/{id}/
-            Actualizar datos del usuario (rol, contraseña, etc.)
-            """
-            instance = self.get_object()
-            
-            # Solo admin o el propio usuario pueden actualizar
-            if not request.user.is_admin and request.user.id != instance.id:
-                return Response(
-                    {'error': 'No tienes permiso para actualizar este usuario'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            # Si se está cambiando el rol, solo admin puede hacerlo
-            if 'role' in request.data and not request.user.is_admin:
-                return Response(
-                    {'error': 'Solo administradores pueden cambiar roles'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            serializer = self.get_serializer(instance, data=request.data, partial=True)
-            serializer.is_valid(raise_exception=True)
-            self.perform_update(serializer)
-            
-            # Registrar actividad
-            ActivityLog.objects.create(
-                user=request.user,
-                action='update',
-                entity_type='user',
-                entity_id=instance.id,
-                details={'changes': request.data}
-            )
-            
-            return Response(serializer.data)
+    def partial_update(self, request, *args, **kwargs):
+        """
+        PATCH /api/users/{id}/
+        Actualizar datos del usuario (rol, contraseña, etc.)
+        """
+        instance = self.get_object()
         
-        @action(detail=True, methods=['get'], url_path='activity')
-        def user_activity(self, request, pk=None):
-            """
-            GET /api/users/{id}/activity/
-            Histórico de actividad de un usuario
-            """
-            user = self.get_object()
-            
-            # Solo admin o el propio usuario pueden ver su actividad
-            if not request.user.is_admin and request.user.id != user.id:
-                return Response(
-                    {'error': 'No tienes permiso para ver esta actividad'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            # Ventas realizadas
-            sales = Sale.objects.filter(user=user, is_cancelled=False).order_by('-date')[:10]
-            sales_count = Sale.objects.filter(user=user, is_cancelled=False).count()
-            total_sales = Sale.objects.filter(user=user, is_cancelled=False).aggregate(
-                total=Sum('total_price')
-            )['total'] or 0
-            
-            # Productos creados (solo si es admin)
-            products_created = Product.objects.filter(user=user).count() if user.is_admin else 0
-            
-            # Logs de actividad recientes
-            activity_logs = ActivityLog.objects.filter(user=user).order_by('-created_at')[:20]
-            
-            data = {
-                'sales_count': sales_count,
-                'total_sales_amount': float(total_sales),
-                'products_created': products_created,
-                'recent_sales': SaleSerializer(sales, many=True).data,
-                'recent_activity': ActivityLogSerializer(activity_logs, many=True).data
-            }
-            
-            return Response(data)
-
+        # Solo admin o el propio usuario pueden actualizar
+        if not request.user.is_admin and request.user.id != instance.id:
+            return Response(
+                {'error': 'No tienes permiso para actualizar este usuario'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Si se está cambiando el rol, solo admin puede hacerlo
+        if 'role' in request.data and not request.user.is_admin:
+            return Response(
+                {'error': 'Solo administradores pueden cambiar roles'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        
+        # Registrar actividad
+        ActivityLog.objects.create(
+            user=request.user,
+            action='update',
+            entity_type='user',
+            entity_id=instance.id,
+            details={'changes': request.data}
+        )
+        
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='activity')
+    def user_activity(self, request, pk=None):
+        """
+        GET /api/users/{id}/activity/
+        Histórico de actividad de un usuario
+        """
+        user = self.get_object()
+        
+        # Solo admin o el propio usuario pueden ver su actividad
+        if not request.user.is_admin and request.user.id != user.id:
+            return Response(
+                {'error': 'No tienes permiso para ver esta actividad'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Ventas realizadas
+        sales = Sale.objects.filter(user=user, is_cancelled=False).order_by('-date')[:10]
+        sales_count = Sale.objects.filter(user=user, is_cancelled=False).count()
+        total_sales = Sale.objects.filter(user=user, is_cancelled=False).aggregate(
+            total=Sum('total_price')
+        )['total'] or 0
+        
+        # Productos creados (solo si es admin)
+        products_created = Product.objects.filter(user=user).count() if user.is_admin else 0
+        
+        # Logs de actividad recientes
+        activity_logs = ActivityLog.objects.filter(user=user).order_by('-created_at')[:20]
+        
+        data = {
+            'sales_count': sales_count,
+            'total_sales_amount': float(total_sales),
+            'products_created': products_created,
+            'recent_sales': SaleSerializer(sales, many=True, context={'request': request}).data,
+            'recent_activity': ActivityLogSerializer(activity_logs, many=True).data
+        }
+        
+        return Response(data)
 
 class ProductViewSet(viewsets.ModelViewSet):
     """
@@ -353,6 +321,430 @@ class ProductViewSet(viewsets.ModelViewSet):
             'adjustment': adjustment
         })
     
+    @action(detail=False, methods=['post'], url_path='scan', permission_classes=[IsAuthenticated])
+    def scan_product(self, request):
+        """
+        POST /api/products/scan/
+        
+        Endpoint principal para escanear códigos QR o de barras desde Flutter.
+        Usado por empleados en el punto de venta para identificar productos.
+        
+        REQUEST:
+        {
+            "code": "ABC123",           # Código escaneado (requerido)
+            "code_type": "qr"           # Tipo: "qr" o "barcode" (opcional)
+        }
+        
+        RESPONSE EXITOSO (200):
+        {
+            "success": true,
+            "product": {
+                "id": 1,
+                "code": "ABC123",
+                "name": "Tornillo 1/2 pulgada",
+                "description": "Tornillo galvanizado",
+                "price": 2.50,
+                "stock": 150,
+                "stock_status": "available",
+                "category": "Ferretería",
+                "available": true,
+                "qr_code_url": "http://servidor.com/api/products/1/qrcode/",
+                "barcode_url": "http://servidor.com/api/products/1/barcode/"
+            }
+        }
+        
+        RESPONSE ERROR (404):
+        {
+            "success": false,
+            "error": "No se encontró ningún producto con el código: ABC123",
+            "error_code": "PRODUCT_NOT_FOUND"
+        }
+        """
+        
+        # Obtener y validar datos
+        code = request.data.get('code')
+        code_type = request.data.get('code_type', 'qr')
+        
+        if not code:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'El campo "code" es requerido',
+                    'error_code': 'MISSING_CODE'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if code_type not in ['qr', 'barcode']:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'El campo "code_type" debe ser "qr" o "barcode"',
+                    'error_code': 'INVALID_CODE_TYPE'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Normalizar código (eliminar espacios, convertir a mayúsculas)
+        code_cleaned = code.strip().upper()
+        
+        try:
+            # Buscar producto
+            product = Product.objects.select_related('user').get(code=code_cleaned)
+            
+            # Verificar permisos según rol
+            user = request.user
+            
+            if user.is_admin:
+                # Admin solo puede escanear sus propios productos
+                if product.user_id != user.id:
+                    return Response(
+                        {
+                            'success': False,
+                            'error': 'Este producto no pertenece a tu inventario',
+                            'error_code': 'PRODUCT_NOT_AUTHORIZED'
+                        },
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            
+            elif user.is_empleado:
+                # Empleado puede escanear productos de su jefe
+                if not user.manager or product.user_id != user.manager.id:
+                    return Response(
+                        {
+                            'success': False,
+                            'error': 'Este producto no pertenece al inventario de tu negocio',
+                            'error_code': 'PRODUCT_NOT_AUTHORIZED'
+                        },
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            
+            # Determinar estado del stock
+            if product.stock > 10:
+                stock_status = 'available'
+            elif product.stock > 0:
+                stock_status = 'low'
+            else:
+                stock_status = 'out_of_stock'
+            
+            available = product.stock > 0
+            
+            # Construir URLs para imágenes
+            qr_code_url = None
+            barcode_url = None
+            
+            if product.qr_code_path:
+                qr_code_url = request.build_absolute_uri(
+                    f'/api/products/{product.id}/qrcode/'
+                )
+            
+            if product.barcode_path:
+                barcode_url = request.build_absolute_uri(
+                    f'/api/products/{product.id}/barcode/'
+                )
+            
+            # Registrar log de escaneo
+            ActivityLog.objects.create(
+                user=request.user,
+                action='scan',
+                entity_type='product',
+                entity_id=product.id,
+                details={
+                    'code': code_cleaned,
+                    'code_type': code_type,
+                    'stock_at_scan': product.stock
+                }
+            )
+            
+            # Respuesta exitosa
+            return Response({
+                'success': True,
+                'product': {
+                    'id': product.id,
+                    'code': product.code if product.code else '',
+                    'name': product.name,
+                    'price': float(product.price),
+                    'stock': product.stock,
+                    'stock_status': stock_status,
+                    'category': product.category if product.category else 'Sin categoría',
+                    'available': available,
+                    'qr_code_url': qr_code_url,
+                    'barcode_url': barcode_url,
+                    'user_id': product.user_id
+                }
+            }, status=status.HTTP_200_OK)
+        
+        except Product.DoesNotExist:
+            return Response(
+                {
+                    'success': False,
+                    'error': f'No se encontró ningún producto con el código: {code_cleaned}',
+                    'error_code': 'PRODUCT_NOT_FOUND',
+                    'scanned_code': code_cleaned
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        except Exception as e:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'Error al procesar el escaneo',
+                    'error_code': 'INTERNAL_ERROR',
+                    'details': str(e) if settings.DEBUG else None
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+    @action(detail=False, methods=['post'], url_path='validate-products', permission_classes=[IsAuthenticated])
+    def validate_products(self, request):
+        """
+        POST /api/products/validate-products/
+        
+        Valida múltiples productos antes de crear una venta.
+        El empleado escanea productos y antes de confirmar la venta,
+        valida que todos tengan stock suficiente.
+        
+        REQUEST:
+        {
+            "items": [
+                {"product_id": 1, "quantity": 2},
+                {"product_id": 5, "quantity": 1},
+                {"product_id": 12, "quantity": 3}
+            ]
+        }
+        
+        RESPONSE (200):
+        {
+            "success": true,
+            "valid": true,
+            "items": [
+                {
+                    "product_id": 1,
+                    "name": "Tornillo 1/2",
+                    "price": 2.50,
+                    "quantity": 2,
+                    "subtotal": 5.00,
+                    "stock_available": 150,
+                    "valid": true
+                },
+                {
+                    "product_id": 5,
+                    "name": "Clavo 3 pulgadas",
+                    "price": 1.00,
+                    "quantity": 1,
+                    "subtotal": 1.00,
+                    "stock_available": 200,
+                    "valid": true
+                }
+            ],
+            "summary": {
+                "total_items": 3,
+                "total_amount": 6.00,
+                "all_valid": true
+            },
+            "errors": []
+        }
+        
+        RESPONSE CON ERRORES (200):
+        {
+            "success": true,
+            "valid": false,
+            "items": [...],
+            "summary": {...},
+            "errors": [
+                {
+                    "product_id": 12,
+                    "error": "Stock insuficiente",
+                    "requested": 3,
+                    "available": 1
+                }
+            ]
+        }
+        """
+        
+        items_data = request.data.get('items', [])
+        
+        if not items_data or not isinstance(items_data, list):
+            return Response(
+                {
+                    'success': False,
+                    'error': 'Se requiere un array de items con formato: [{"product_id": 1, "quantity": 2}]',
+                    'error_code': 'INVALID_FORMAT'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user = request.user
+        validated_items = []
+        errors = []
+        total_amount = Decimal('0.00')
+        total_items = 0
+        all_valid = True
+        
+        for item_data in items_data:
+            product_id = item_data.get('product_id')
+            quantity = item_data.get('quantity', 1)
+            
+            # Validaciones básicas
+            if not product_id:
+                errors.append({
+                    'error': 'product_id es requerido',
+                    'item': item_data
+                })
+                all_valid = False
+                continue
+            
+            if not isinstance(quantity, int) or quantity <= 0:
+                errors.append({
+                    'product_id': product_id,
+                    'error': 'Cantidad debe ser un número entero positivo',
+                    'quantity': quantity
+                })
+                all_valid = False
+                continue
+            
+            try:
+                product = Product.objects.get(id=product_id)
+                
+                # Verificar permisos
+                if user.is_admin and product.user_id != user.id:
+                    errors.append({
+                        'product_id': product_id,
+                        'error': 'No tienes permiso para vender este producto'
+                    })
+                    all_valid = False
+                    continue
+                
+                if user.is_empleado and (not user.manager or product.user_id != user.manager.id):
+                    errors.append({
+                        'product_id': product_id,
+                        'error': 'Este producto no pertenece a tu negocio'
+                    })
+                    all_valid = False
+                    continue
+                
+                # Verificar stock
+                stock_valid = product.stock >= quantity
+                if not stock_valid:
+                    errors.append({
+                        'product_id': product_id,
+                        'name': product.name,
+                        'error': 'Stock insuficiente',
+                        'requested': quantity,
+                        'available': product.stock
+                    })
+                    all_valid = False
+                
+                # Calcular subtotal
+                subtotal = product.price * quantity
+                
+                validated_items.append({
+                    'product_id': product.id,
+                    'code': product.code,
+                    'name': product.name,
+                    'price': float(product.price),
+                    'quantity': quantity,
+                    'subtotal': float(subtotal),
+                    'stock_available': product.stock,
+                    'valid': stock_valid
+                })
+                
+                if stock_valid:
+                    total_amount += subtotal
+                    total_items += quantity
+            
+            except Product.DoesNotExist:
+                errors.append({
+                    'product_id': product_id,
+                    'error': 'Producto no encontrado'
+                })
+                all_valid = False
+        
+        return Response({
+            'success': True,
+            'valid': all_valid,
+            'items': validated_items,
+            'summary': {
+                'total_items': total_items,
+                'total_amount': float(total_amount),
+                'all_valid': all_valid,
+                'items_count': len(validated_items)
+            },
+            'errors': errors
+        })
+    
+    @action(detail=False, methods=['get'], url_path='quick-search', permission_classes=[IsAuthenticated])
+    def quick_search(self, request):
+        """
+        GET /api/products/quick-search/?q=tornillo
+        
+        Búsqueda rápida de productos por nombre o código.
+        Útil para cuando el escaneo falla o el producto no tiene código.
+        
+        RESPONSE:
+        {
+            "success": true,
+            "count": 3,
+            "products": [
+                {
+                    "id": 1,
+                    "code": "ABC123",
+                    "name": "Tornillo 1/2 pulgada",
+                    "price": 2.50,
+                    "stock": 150,
+                    "available": true,
+                    "category": "Ferretería"
+                },
+                ...
+            ]
+        }
+        """
+        query = request.query_params.get('q', '').strip()
+        
+        if not query or len(query) < 2:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'Se requiere un término de búsqueda de al menos 2 caracteres',
+                    'error_code': 'QUERY_TOO_SHORT'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user = request.user
+        
+        # Filtrar productos según permisos
+        if user.is_admin:
+            products = Product.objects.filter(user=user)
+        elif user.is_empleado and user.manager:
+            products = Product.objects.filter(user=user.manager)
+        else:
+            products = Product.objects.none()
+        
+        # Buscar por nombre o código
+        products = products.filter(
+            models.Q(name__icontains=query) | models.Q(code__icontains=query)
+        )[:20]  # Limitar a 20 resultados
+        
+        results = []
+        for product in products:
+            results.append({
+                'id': product.id,
+                'code': product.code,
+                'name': product.name,
+                'price': float(product.price),
+                'stock': product.stock,
+                'available': product.stock > 0,
+                'category': product.category or 'Sin categoría'
+            })
+        
+        return Response({
+            'success': True,
+            'count': len(results),
+            'products': results
+        })
 
 
 
@@ -559,6 +951,266 @@ class SaleViewSet(viewsets.ModelViewSet):
             'message': 'Venta cancelada exitosamente',
             'sale': SaleSerializer(sale, context={'request': request}).data
         })
+    
+    @action(detail=False, methods=['post'], url_path='create-from-scan', permission_classes=[IsAuthenticated])
+    @transaction.atomic
+    def create_from_scan(self, request):
+        """
+        POST /api/sales/create-from-scan/
+        
+        Crea una venta directamente desde productos escaneados en Flutter.
+        Este es el endpoint principal que usará la app móvil para registrar ventas.
+        
+        REQUEST:
+        {
+            "items": [
+                {"product_id": 1, "quantity": 2},
+                {"product_id": 5, "quantity": 1}
+            ],
+            "payment_method": "efectivo",    # efectivo, tarjeta, transferencia
+            "notes": "Cliente frecuente"      # Opcional
+        }
+        
+        RESPONSE EXITOSO (201):
+        {
+            "success": true,
+            "sale": {
+                "id": 45,
+                "date": "2025-01-15T14:30:00Z",
+                "total_price": 6.00,
+                "payment_method": "efectivo",
+                "user": {
+                    "id": 3,
+                    "username": "empleado1"
+                },
+                "items": [
+                    {
+                        "product": {
+                            "id": 1,
+                            "code": "ABC123",
+                            "name": "Tornillo 1/2"
+                        },
+                        "quantity": 2,
+                        "price": 2.50,
+                        "subtotal": 5.00
+                    },
+                    {
+                        "product": {
+                            "id": 5,
+                            "code": "XYZ789",
+                            "name": "Clavo 3 pulgadas"
+                        },
+                        "quantity": 1,
+                        "price": 1.00,
+                        "subtotal": 1.00
+                    }
+                ]
+            },
+            "message": "Venta registrada exitosamente",
+            "stock_updated": true
+        }
+        
+        RESPONSE ERROR (400):
+        {
+            "success": false,
+            "error": "Stock insuficiente para algunos productos",
+            "errors": [
+                {
+                    "product_id": 1,
+                    "name": "Tornillo 1/2",
+                    "requested": 5,
+                    "available": 2
+                }
+            ]
+        }
+        """
+        
+        # Validar datos de entrada
+        items_data = request.data.get('items', [])
+        payment_method = request.data.get('payment_method', 'efectivo')
+        notes = request.data.get('notes', '')
+        
+        if not items_data or not isinstance(items_data, list) or len(items_data) == 0:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'Se requiere al menos un producto para crear una venta',
+                    'error_code': 'NO_ITEMS'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if payment_method not in ['efectivo', 'tarjeta', 'transferencia']:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'Método de pago inválido. Opciones: efectivo, tarjeta, transferencia',
+                    'error_code': 'INVALID_PAYMENT_METHOD'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user = request.user
+        total_price = Decimal('0.00')
+        sale_items = []
+        errors = []
+        
+        # Validar todos los productos antes de crear la venta
+        for item_data in items_data:
+            product_id = item_data.get('product_id')
+            quantity = item_data.get('quantity', 1)
+            
+            if not product_id or not isinstance(quantity, int) or quantity <= 0:
+                return Response(
+                    {
+                        'success': False,
+                        'error': 'Formato inválido en items. Se requiere product_id (int) y quantity (int > 0)',
+                        'error_code': 'INVALID_ITEM_FORMAT'
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                product = Product.objects.select_for_update().get(id=product_id)
+                
+                # Verificar permisos
+                if user.is_admin and product.user_id != user.id:
+                    errors.append({
+                        'product_id': product_id,
+                        'error': 'No tienes permiso para vender este producto'
+                    })
+                    continue
+                
+                if user.is_empleado and (not user.manager or product.user_id != user.manager.id):
+                    errors.append({
+                        'product_id': product_id,
+                        'error': 'Este producto no pertenece a tu negocio'
+                    })
+                    continue
+                
+                # Verificar stock suficiente
+                if product.stock < quantity:
+                    errors.append({
+                        'product_id': product_id,
+                        'name': product.name,
+                        'code': product.code,
+                        'error': 'Stock insuficiente',
+                        'requested': quantity,
+                        'available': product.stock
+                    })
+                    continue
+                
+                # Agregar a la lista de items válidos
+                subtotal = product.price * quantity
+                total_price += subtotal
+                
+                sale_items.append({
+                    'product': product,
+                    'quantity': quantity,
+                    'price': product.price,
+                    'subtotal': subtotal
+                })
+            
+            except Product.DoesNotExist:
+                errors.append({
+                    'product_id': product_id,
+                    'error': 'Producto no encontrado'
+                })
+        
+        # Si hay errores, no crear la venta
+        if errors:
+            return Response(
+                {
+                    'success': False,
+                    'error': 'No se pudo completar la venta',
+                    'errors': errors,
+                    'error_code': 'VALIDATION_FAILED'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Crear la venta
+        sale = Sale.objects.create(
+            user=request.user,
+            total_price=total_price,
+            payment_method=payment_method
+        )
+        
+        # Crear items de venta y actualizar stock
+        for item_data in sale_items:
+            product = item_data['product']
+            quantity = item_data['quantity']
+            price = item_data['price']
+            subtotal = item_data['subtotal']
+            
+            # Crear item de venta
+            SaleItem.objects.create(
+                sale=sale,
+                product=product,
+                quantity=quantity,
+                price=price,
+                subtotal=subtotal
+            )
+            
+            # Actualizar stock
+            product.stock -= quantity
+            product.save()
+            
+            # Registrar movimiento de inventario
+            InventoryMovement.objects.create(
+                product=product,
+                movement_type='salida',
+                quantity=quantity,
+                note=f'Venta #{sale.id} - {request.user.username}'
+            )
+        
+        # Registrar actividad
+        ActivityLog.objects.create(
+            user=request.user,
+            action='create',
+            entity_type='sale',
+            entity_id=sale.id,
+            details={
+                'total_price': float(total_price),
+                'items_count': len(sale_items),
+                'payment_method': payment_method,
+                'created_from': 'flutter_scan'
+            }
+        )
+        
+        # Preparar respuesta
+        sale_data = {
+            'id': sale.id,
+            'date': sale.date.isoformat(),
+            'total_price': float(sale.total_price),
+            'payment_method': payment_method,
+            'notes': notes,
+            'user': {
+                'id': request.user.id,
+                'username': request.user.username
+            },
+            'items': []
+        }
+        
+        # Agregar items a la respuesta
+        for sale_item in sale.items.all():
+            sale_data['items'].append({
+                'product': {
+                    'id': sale_item.product.id,
+                    'code': sale_item.product.code,
+                    'name': sale_item.product.name
+                },
+                'quantity': sale_item.quantity,
+                'price': float(sale_item.price),
+                'subtotal': float(sale_item.subtotal)
+            })
+        
+        return Response({
+            'success': True,
+            'sale': sale_data,
+            'message': 'Venta registrada exitosamente',
+            'stock_updated': True
+        }, status=status.HTTP_201_CREATED)
 
 
 
@@ -1035,6 +1687,7 @@ def register_user(request):
 class DashboardViewSet(viewsets.ViewSet):
     """
     ViewSet para dashboard y resúmenes
+    Funciona para Admin y Empleados con datos adaptados a cada rol
     """
     permission_classes = [IsAuthenticated]
     
@@ -1042,7 +1695,22 @@ class DashboardViewSet(viewsets.ViewSet):
     def summary(self, request):
         """
         GET /api/dashboard/summary/
-        Resumen global del dashboard
+        
+        Resumen global del dashboard adaptado según el rol del usuario.
+        
+        ADMIN ve:
+        - Sus ventas + ventas de sus empleados
+        - Sus productos
+        - Ventas por empleado
+        - Top productos
+        - Stock bajo
+        
+        EMPLEADO ve:
+        - Solo sus propias ventas
+        - Productos de su manager
+        - Sus estadísticas personales
+        - Top productos que ha vendido
+        - Stock bajo de productos de su manager
         """
         from django.utils.timezone import now
         import datetime
@@ -1052,82 +1720,429 @@ class DashboardViewSet(viewsets.ViewSet):
         start_datetime = make_aware(datetime.datetime.combine(today, datetime.time.min))
         end_datetime = make_aware(datetime.datetime.combine(today, datetime.time.max))
         
-        # Determinar qué datos puede ver según rol
+        # ============================================
+        # DETERMINAR DATOS SEGÚN ROL
+        # ============================================
+        
         if user.is_admin:
-            # Admin ve sus datos + de sus empleados
+            # ===== ADMIN =====
+            # Ve sus datos + de sus empleados
             employee_ids = list(user.employees.values_list('id', flat=True))
             user_ids = [user.id] + employee_ids
             products_queryset = Product.objects.filter(user=user)
-        else:
-            # Empleado solo ve sus datos
+            
+            # Información del rol
+            role_info = {
+                'role': 'admin',
+                'can_manage_products': True,
+                'can_manage_employees': True,
+                'employees_count': len(employee_ids)
+            }
+            
+        elif user.is_empleado:
+            # ===== EMPLEADO =====
+            # Solo ve sus propios datos
             user_ids = [user.id]
-            products_queryset = Product.objects.filter(user=user.manager) if user.manager else Product.objects.none()
+            
+            # Productos de su manager
+            if user.manager:
+                products_queryset = Product.objects.filter(user=user.manager)
+            else:
+                products_queryset = Product.objects.none()
+            
+            # Información del rol
+            role_info = {
+                'role': 'empleado',
+                'can_manage_products': False,
+                'can_manage_employees': False,
+                'manager': {
+                    'id': user.manager.id if user.manager else None,
+                    'username': user.manager.username if user.manager else None
+                } if user.manager else None
+            }
+        else:
+            # Usuario sin rol definido
+            return Response(
+                {'error': 'Usuario sin rol asignado'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
-        # 1. Ventas de hoy
+        # ============================================
+        # 1. VENTAS DE HOY
+        # ============================================
+        
         today_sales = Sale.objects.filter(
             user_id__in=user_ids,
             date__gte=start_datetime,
             date__lte=end_datetime,
             is_cancelled=False
         )
+        
         today_sales_data = {
             'count': today_sales.count(),
             'total': float(today_sales.aggregate(total=Sum('total_price'))['total'] or 0)
         }
         
-        # 2. Top producto (últimos 30 días)
+        # ============================================
+        # 2. VENTAS DE LA SEMANA
+        # ============================================
+        
+        start_of_week = today - datetime.timedelta(days=today.weekday())
+        week_start_datetime = make_aware(datetime.datetime.combine(start_of_week, datetime.time.min))
+        
+        week_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=week_start_datetime,
+            date__lte=end_datetime,
+            is_cancelled=False
+        )
+        
+        week_sales_data = {
+            'count': week_sales.count(),
+            'total': float(week_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+        }
+        
+        # ============================================
+        # 3. VENTAS DEL MES
+        # ============================================
+        
+        start_of_month = today.replace(day=1)
+        month_start_datetime = make_aware(datetime.datetime.combine(start_of_month, datetime.time.min))
+        
+        month_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=month_start_datetime,
+            date__lte=end_datetime,
+            is_cancelled=False
+        )
+        
+        month_sales_data = {
+            'count': month_sales.count(),
+            'total': float(month_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+        }
+        
+        # ============================================
+        # 4. TOP PRODUCTOS (Últimos 30 días)
+        # ============================================
+        
         thirty_days_ago = now() - datetime.timedelta(days=30)
-        top_product_data = SaleItem.objects.filter(
+        
+        # Top 5 productos más vendidos
+        top_products = SaleItem.objects.filter(
             sale__date__gte=thirty_days_ago,
             sale__user_id__in=user_ids,
             sale__is_cancelled=False
-        ).values('product__name', 'product__code').annotate(
-            total_quantity=Sum('quantity')
-        ).order_by('-total_quantity').first()
+        ).values('product__id', 'product__name', 'product__code').annotate(
+            total_quantity=Sum('quantity'),
+            total_amount=Sum('subtotal')
+        ).order_by('-total_quantity')[:5]
         
-        # 3. Stock bajo
-        low_stock_products = products_queryset.filter(stock__lte=10)
+        top_products_data = []
+        for item in top_products:
+            top_products_data.append({
+                'product_id': item['product__id'],
+                'product_name': item['product__name'],
+                'product_code': item['product__code'],
+                'quantity_sold': int(item['total_quantity']),
+                'total_amount': float(item['total_amount'])
+            })
+        
+        # ============================================
+        # 5. STOCK BAJO (Productos con stock <= 10)
+        # ============================================
+        
+        low_stock_products = products_queryset.filter(stock__lte=10).order_by('stock')
+        
         low_stock_data = []
-        for p in low_stock_products[:5]:
+        for p in low_stock_products[:5]:  # Solo mostrar los 5 más críticos
             low_stock_data.append({
                 'id': p.id,
                 'name': p.name,
-                'code': p.code,
+                'code': p.code if p.code else '',
                 'stock': p.stock,
-                'status': 'critical' if p.stock <= 5 else 'low'
+                'category': p.category if p.category else 'Sin categoría',
+                'status': 'critical' if p.stock <= 5 else 'low',
+                'price': float(p.price)
             })
         
-        # 4. Ventas por empleado (solo para admin)
-        sales_by_employee = []
-        if user.is_admin:
-            for emp_id in employee_ids:
-                emp = User.objects.get(id=emp_id)
-                emp_sales = Sale.objects.filter(
-                    user_id=emp_id,
-                    date__gte=start_datetime,
-                    date__lte=end_datetime,
-                    is_cancelled=False
-                )
-                sales_by_employee.append({
-                    'employee_id': emp.id,
-                    'employee_name': emp.username,
-                    'sales_count': emp_sales.count(),
-                    'sales_total': float(emp_sales.aggregate(total=Sum('total_price'))['total'] or 0)
-                })
+        # ============================================
+        # 6. VALOR TOTAL DEL INVENTARIO
+        # ============================================
         
-        # 5. Valor total del inventario
         total_inventory_value = sum(float(p.price * p.stock) for p in products_queryset)
+        total_products_count = products_queryset.count()
         
-        response_data = {
-            'today_sales': today_sales_data,
-            'top_product': top_product_data or {},
-            'low_stock_count': low_stock_products.count(),
-            'low_stock_products': low_stock_data,
-            'sales_by_employee': sales_by_employee,
-            'total_inventory_value': total_inventory_value
+        inventory_summary = {
+            'total_value': total_inventory_value,
+            'total_products': total_products_count,
+            'low_stock_count': low_stock_products.count()
         }
         
+        # ============================================
+        # 7. VENTAS POR EMPLEADO (Solo para Admin)
+        # ============================================
+        
+        sales_by_employee = []
+        
+        if user.is_admin and len(employee_ids) > 0:
+            for emp_id in employee_ids:
+                try:
+                    emp = User.objects.get(id=emp_id)
+                    
+                    # Ventas del día del empleado
+                    emp_today_sales = Sale.objects.filter(
+                        user_id=emp_id,
+                        date__gte=start_datetime,
+                        date__lte=end_datetime,
+                        is_cancelled=False
+                    )
+                    
+                    # Ventas del mes del empleado
+                    emp_month_sales = Sale.objects.filter(
+                        user_id=emp_id,
+                        date__gte=month_start_datetime,
+                        date__lte=end_datetime,
+                        is_cancelled=False
+                    )
+                    
+                    sales_by_employee.append({
+                        'employee_id': emp.id,
+                        'employee_name': emp.username,
+                        'employee_email': emp.email,
+                        'today': {
+                            'count': emp_today_sales.count(),
+                            'total': float(emp_today_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+                        },
+                        'month': {
+                            'count': emp_month_sales.count(),
+                            'total': float(emp_month_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+                        }
+                    })
+                except User.DoesNotExist:
+                    continue
+        
+        # ============================================
+        # 8. ESTADÍSTICAS PERSONALES DEL USUARIO
+        # ============================================
+        
+        # Ventas personales del usuario actual (últimos 30 días)
+        user_personal_sales = Sale.objects.filter(
+            user=user,
+            date__gte=thirty_days_ago,
+            is_cancelled=False
+        )
+        
+        personal_stats = {
+            'sales_last_30_days': user_personal_sales.count(),
+            'total_last_30_days': float(user_personal_sales.aggregate(total=Sum('total_price'))['total'] or 0),
+            'average_sale': 0
+        }
+        
+        if personal_stats['sales_last_30_days'] > 0:
+            personal_stats['average_sale'] = personal_stats['total_last_30_days'] / personal_stats['sales_last_30_days']
+        
+        # ============================================
+        # 9. VENTAS RECIENTES (Últimas 5 ventas)
+        # ============================================
+        
+        recent_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            is_cancelled=False
+        ).select_related('user').order_by('-date')[:5]
+        
+        recent_sales_data = []
+        for sale in recent_sales:
+            recent_sales_data.append({
+                'id': sale.id,
+                'date': sale.date.isoformat(),
+                'total_price': float(sale.total_price),
+                'user': {
+                    'id': sale.user.id,
+                    'username': sale.user.username
+                },
+                'items_count': sale.items.count()
+            })
+        
+        # ============================================
+        # 10. COMPARACIÓN CON PERÍODO ANTERIOR
+        # ============================================
+        
+        # Ventas del mes anterior
+        if start_of_month.month == 1:
+            previous_month_start = start_of_month.replace(year=start_of_month.year - 1, month=12, day=1)
+        else:
+            previous_month_start = start_of_month.replace(month=start_of_month.month - 1, day=1)
+        
+        # Último día del mes anterior
+        previous_month_end = start_of_month - datetime.timedelta(days=1)
+        
+        previous_month_start_datetime = make_aware(datetime.datetime.combine(previous_month_start, datetime.time.min))
+        previous_month_end_datetime = make_aware(datetime.datetime.combine(previous_month_end, datetime.time.max))
+        
+        previous_month_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=previous_month_start_datetime,
+            date__lte=previous_month_end_datetime,
+            is_cancelled=False
+        )
+        
+        previous_month_total = float(previous_month_sales.aggregate(total=Sum('total_price'))['total'] or 0)
+        current_month_total = month_sales_data['total']
+        
+        # Calcular porcentaje de cambio
+        if previous_month_total > 0:
+            percentage_change = ((current_month_total - previous_month_total) / previous_month_total) * 100
+        else:
+            percentage_change = 100 if current_month_total > 0 else 0
+        
+        comparison_data = {
+            'current_month_total': current_month_total,
+            'previous_month_total': previous_month_total,
+            'percentage_change': round(percentage_change, 2),
+            'trend': 'up' if percentage_change > 0 else ('down' if percentage_change < 0 else 'stable')
+        }
+        
+        # ============================================
+        # CONSTRUIR RESPUESTA FINAL
+        # ============================================
+        
+        response_data = {
+            'user_info': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'role': role_info
+            },
+            'today_sales': today_sales_data,
+            'week_sales': week_sales_data,
+            'month_sales': month_sales_data,
+            'top_products': top_products_data,
+            'low_stock': {
+                'count': low_stock_products.count(),
+                'products': low_stock_data
+            },
+            'inventory_summary': inventory_summary,
+            'personal_stats': personal_stats,
+            'recent_sales': recent_sales_data,
+            'comparison': comparison_data,
+            'timestamp': now().isoformat()
+        }
+        
+        # Agregar ventas por empleado solo si es admin
+        if user.is_admin:
+            response_data['sales_by_employee'] = sales_by_employee
+        
         return Response(response_data)
+    
+    @action(detail=False, methods=['get'], url_path='quick-stats')
+    def quick_stats(self, request):
+        """
+        GET /api/dashboard/quick-stats/
+        
+        Estadísticas rápidas y ligeras para la vista inicial
+        Ideal para cargar rápidamente en Flutter
+        """
+        from django.utils.timezone import now
+        import datetime
+        
+        user = request.user
+        today = now().date()
+        start_datetime = make_aware(datetime.datetime.combine(today, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(today, datetime.time.max))
+        
+        # Determinar user_ids según rol
+        if user.is_admin:
+            employee_ids = list(user.employees.values_list('id', flat=True))
+            user_ids = [user.id] + employee_ids
+        else:
+            user_ids = [user.id]
+        
+        # Solo 4 datos esenciales
+        today_sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=start_datetime,
+            date__lte=end_datetime,
+            is_cancelled=False
+        ).aggregate(
+            count=Count('id'),
+            total=Sum('total_price')
+        )
+        
+        return Response({
+            'today_sales_count': today_sales['count'] or 0,
+            'today_sales_total': float(today_sales['total'] or 0),
+            'timestamp': now().isoformat()
+        })
+    
+    @action(detail=False, methods=['get'], url_path='sales-chart')
+    def sales_chart(self, request):
+        """
+        GET /api/dashboard/sales-chart/?period=week
+        
+        Datos para gráficos de ventas
+        Parámetros:
+        - period: day (últimos 7 días), week (últimas 4 semanas), month (últimos 12 meses)
+        """
+        from django.utils.timezone import now
+        import datetime
+        from collections import defaultdict
+        
+        user = request.user
+        period = request.query_params.get('period', 'day')
+        
+        # Determinar user_ids según rol
+        if user.is_admin:
+            employee_ids = list(user.employees.values_list('id', flat=True))
+            user_ids = [user.id] + employee_ids
+        else:
+            user_ids = [user.id]
+        
+        # Determinar rango de fechas
+        now_time = now()
+        if period == 'day':
+            start_date = now_time - datetime.timedelta(days=7)
+            date_format = '%Y-%m-%d'
+        elif period == 'week':
+            start_date = now_time - datetime.timedelta(weeks=4)
+            date_format = '%Y-W%U'
+        elif period == 'month':
+            start_date = now_time - datetime.timedelta(days=365)
+            date_format = '%Y-%m'
+        else:
+            start_date = now_time - datetime.timedelta(days=30)
+            date_format = '%Y-%m-%d'
+        
+        # Obtener ventas
+        sales = Sale.objects.filter(
+            user_id__in=user_ids,
+            date__gte=start_date,
+            is_cancelled=False
+        ).order_by('date')
+        
+        # Agrupar por período
+        grouped = defaultdict(lambda: {'total': 0, 'count': 0})
+        
+        for sale in sales:
+            key = sale.date.strftime(date_format)
+            grouped[key]['total'] += float(sale.total_price)
+            grouped[key]['count'] += 1
+        
+        # Convertir a lista ordenada
+        chart_data = [
+            {
+                'period': k,
+                'total': v['total'],
+                'count': v['count'],
+                'average': v['total'] / v['count'] if v['count'] > 0 else 0
+            }
+            for k, v in sorted(grouped.items())
+        ]
+        
+        return Response({
+            'period_type': period,
+            'start_date': start_date.date().isoformat(),
+            'data': chart_data
+        })
 class SystemViewSet(viewsets.ViewSet):
     """ViewSet para operaciones del sistema"""
     permission_classes = [IsAdmin]  # Por defecto admin
