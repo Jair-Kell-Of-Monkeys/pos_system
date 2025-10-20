@@ -7,6 +7,8 @@ from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
 from django.db.models import Sum, Count
@@ -31,6 +33,55 @@ from .permissions import (
 from django.http import FileResponse, Http404
 import os
 
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """
+    Serializador personalizado que incluye datos del usuario en la respuesta
+    """
+    def validate(self, attrs):
+        try:
+            # Obtener los tokens por defecto
+            data = super().validate(attrs)
+            
+            # Construir datos del usuario de forma segura
+            user_data = {
+                'id': self.user.id,
+                'username': self.user.username,
+                'email': getattr(self.user, 'email', ''),
+                'first_name': getattr(self.user, 'first_name', ''),
+                'last_name': getattr(self.user, 'last_name', ''),
+                'is_staff': getattr(self.user, 'is_staff', False),
+                'is_superuser': getattr(self.user, 'is_superuser', False),
+            }
+            
+            # Intentar agregar rol si existe
+            try:
+                if hasattr(self.user, 'role') and self.user.role:
+                    user_data['role'] = {
+                        'id': self.user.role.id,
+                        'name': self.user.role.name
+                    }
+            except Exception as e:
+                print(f" No se pudo obtener rol: {e}")
+            
+            data['user'] = user_data
+            
+            print(f" Login exitoso - Usuario: {self.user.username}")
+            print(f" Respuesta enviada: {data}")
+            
+            return data
+            
+        except Exception as e:
+            print(f" ERROR en CustomTokenObtainPairSerializer: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    """
+    Vista personalizada de login que usa el serializador customizado
+    """
+    serializer_class = CustomTokenObtainPairSerializer
 class RoleViewSet(viewsets.ReadOnlyModelViewSet):
     """
     ViewSet para consultar roles (solo lectura)

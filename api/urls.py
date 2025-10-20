@@ -1,15 +1,13 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
+from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (
     RoleViewSet, UserViewSet, ProductViewSet,
     SaleViewSet, InventoryMovementViewSet, ReportViewSet,
     DashboardViewSet, SystemViewSet,
-    register_user
+    register_user,
+    CustomTokenObtainPairView
 )
 
 router = DefaultRouter()
@@ -24,7 +22,7 @@ router.register(r'system', SystemViewSet, basename='system')
 
 urlpatterns = [
     # Autenticación JWT
-    path('auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('auth/register/', register_user, name='register'),
     
